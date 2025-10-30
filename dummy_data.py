@@ -22,26 +22,15 @@ def get_analytical_solution(t, x, z, z_s, X_SOURCE_POS, Q_PRIME, ALPHA, KAPPA, s
         KAPPA : thermal conductivity [W/(mm·K)]
         sigma : standard deviation of Gaussian source [mm]
     """
-
     t = np.maximum(t, 1e-9)  # avoid t=0 singularity
-
-    # radial distance squared in x-z plane
     r_sq = (x - X_SOURCE_POS)**2 + (z - z_s)**2
-
-    # modified argument including Gaussian width
     denom = 4 * ALPHA * t + 2 * sigma**2
     arg = r_sq / denom
-
-    # temperature rise
     delta_T = (Q_PRIME / (4 * np.pi * KAPPA)) * exp1(arg)
-
-    # return absolute temperature
-    return config.GLOBAL_MIN_TEMP + delta_T
+    return  config.GLOBAL_MIN_TEMP + delta_T
 
 
-
-print("Fase 1: Generating training data...")
-# Training data at different source depths
+print("Phase 1: Generating training data...")
 z_sources_train = config.Z_S_TRAIN
 all_train_inputs = []
 all_train_outputs = []
@@ -51,20 +40,28 @@ t_axis = np.linspace(0, config.T, config.T)
 x_axis = np.linspace(0, config.X, config.X)
 y_axis = np.linspace(0, config.Y, config.Y)
 
+# === Shared Initial Condition points (t = 0, T = minimum temp) ===
+N_ic = config.N_INITIAL  
+t_ic = np.zeros((N_ic, 1))
+x_ic = np.random.rand(N_ic, 1) * config.X
+y_ic = np.random.rand(N_ic, 1) * config.Y
+z_ic = np.random.rand(N_ic, 1) * config.Z
+T_ic_flat = np.full((N_ic, 1), config.GLOBAL_MIN_TEMP)  # initial temp
+
 for z_s in z_sources_train:
     print(f"Generating data for source depth z_s={z_s} mm...")    
-    # --- Superficial data generation ---
+
+    # --- Surface data generation (z=0) ---
     t_grid, x_grid, y_grid = np.meshgrid(t_axis, x_axis, y_axis, indexing='ij')
-    z_grid = np.zeros_like(t_grid) # Superficie z=0
+    z_grid = np.zeros_like(t_grid)
     z_s_grid = np.full_like(t_grid, z_s)
     
-    # Calculate temperature data
     T_data = get_analytical_solution(
         t_grid, x_grid, z_grid, z_s,
-        config.X_SOURCE_POS, config.Q_PRIME, config.ALPHA,config.KAPPA, sigma=config.SIGMA
+        config.X_SOURCE_POS, config.Q_PRIME, config.ALPHA, config.KAPPA, sigma=config.SIGMA
     )
     
-    # Flatten the gridded data for training
+    # Flatten surface data
     t_data_flat = t_grid.flatten()[:, np.newaxis]
     x_data_flat = x_grid.flatten()[:, np.newaxis]
     y_data_flat = y_grid.flatten()[:, np.newaxis] 
@@ -72,79 +69,110 @@ for z_s in z_sources_train:
     z_s_data_flat = z_s_grid.flatten()[:, np.newaxis]
     T_data_flat = T_data.flatten()[:, np.newaxis]
     
-    # Combine input features (now 5 columns)
     data_inputs_combined = np.hstack([t_data_flat, x_data_flat, y_data_flat, z_data_flat, z_s_data_flat])
 
-    # --- Collocation points ---
+    # --- Collocation points (for PDE residual) ---
     t_phys = np.random.rand(config.N_COLLOCATION, 1) * config.T
     x_phys = np.random.rand(config.N_COLLOCATION, 1) * config.X
-    y_phys = np.random.rand(config.N_COLLOCATION, 1) * config.Y # Aggiunta coordinata Y
+    y_phys = np.random.rand(config.N_COLLOCATION, 1) * config.Y 
     z_phys = np.random.rand(config.N_COLLOCATION, 1) * config.Z
     z_s_phys = np.full_like(x_phys, z_s)
     
-    # Combine physical input features (now 5 columns)
     phys_inputs_combined = np.hstack([t_phys, x_phys, y_phys, z_phys, z_s_phys])
-    
-    # --- Combine data and collocation points ---
-    inputs_combined = np.vstack([data_inputs_combined, phys_inputs_combined])
-    outputs_combined = np.vstack([T_data_flat, np.zeros((config.N_COLLOCATION, 1))])
+
+    # --- Attach shared IC points (duplicate z_s for this source) ---
+    z_s_ic = np.full_like(x_ic, z_s)
+    ic_inputs_combined = np.hstack([t_ic, x_ic, y_ic, z_ic, z_s_ic])
+
+    # --- Combine all input/output sets ---
+    inputs_combined = np.vstack([
+        data_inputs_combined,
+        phys_inputs_combined,
+        ic_inputs_combined
+    ])
+    outputs_combined = np.vstack([
+        T_data_flat,
+        np.zeros((config.N_COLLOCATION, 1)),  # dummy targets for PDE points
+        T_ic_flat                              # zero-temperature IC targets
+    ])
 
     all_train_inputs.append(inputs_combined)
     all_train_outputs.append(outputs_combined)
 
 print("Data generation complete.")
 
-
-
 if __name__ == "__main__":
-    print("\nGenerating example DATG plot")
+    import matplotlib.pyplot as plt
 
-    n_frames_to_plot = 5
-    plot_times = np.linspace(1e-9, config.T, n_frames_to_plot) 
-    plot_z_s = config.Z_S_TRAIN[3] 
-    
+    # Pick the first source depth
+    z_s = z_sources_train[0]
 
-    plot_nx, plot_ny = 300, 300
-    x_plot_axis = np.linspace(0, config.X, plot_nx)
-    y_plot_axis = np.linspace(0, config.Y, plot_ny)
-    X_plot_grid, Y_plot_grid = np.meshgrid(x_plot_axis, y_plot_axis)
-    Z_plot_grid = np.zeros_like(X_plot_grid) 
+    # --- Use 2D grids for the 2D analytical solution ---
+    t_axis_plot = np.linspace(0, config.T, config.T) # Renamed to avoid confusion
+    x_plot_axis = np.linspace(0, config.X, config.X)
+    z_plot_axis = np.linspace(0, config.Z, config.Z)
+    y_plot_axis = np.linspace(0, config.Y, config.Y) # Need this for tiling
 
+    t_idxs = [0, config.T // 2, config.T - 1]
 
-    vmax = config.GLOBAL_MAX_TEMP
-    vmin = config.GLOBAL_MIN_TEMP
-    
-    print(f"Plotting 5 frames at z_s={plot_z_s} mm...")
+    for t_idx in t_idxs:
+        t_val = t_axis_plot[t_idx]
 
-    fig, axes = plt.subplots(1, n_frames_to_plot, figsize=(20, 5), sharey=True)
-    
-    for i, t in enumerate(plot_times):
-        T_frame = get_analytical_solution(
-            np.full_like(X_plot_grid, t),
-            X_plot_grid, 
-            Z_plot_grid, 
-            plot_z_s,
-            config.X_SOURCE_POS, config.Q_PRIME, config.ALPHA,config.KAPPA, sigma=config.SIGMA
+        # Create (z, x) grids for T(z, x)
+        Z_plot_grid, X_plot_grid = np.meshgrid(z_plot_axis, x_plot_axis, indexing='ij')
+
+        # --- Calculate the 2D temperature field T(z, x) ---
+        # Pass the scalar z_s (e.g., 10) as the 'z_s' argument
+        T_field_2D = get_analytical_solution(
+            t_val,
+            X_plot_grid,         # 'x' argument
+            Z_plot_grid,         # 'z' argument
+            z_s,                 # 'z_s' argument (the scalar)
+            config.X_SOURCE_POS,
+            config.Q_PRIME, config.ALPHA, config.KAPPA,
+            sigma=config.SIGMA
         )
-        
+        # T_field_2D now has shape (len(z), len(x))
 
-        ax = axes[i]
-        im = ax.imshow(
-            T_frame, 
-            cmap='hot', 
-            vmin=vmin, 
-            vmax=vmax,
-            extent=[0, config.X, 0, config.Y], # Assi x, y
-            origin='lower'
+        # --- Plot three views ---
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle(f"Temperature at t={t_val:.2f} s (source z_s={z_s} mm)")
+
+        # Top view (x-y plane at z=top, z=0)
+        # Solution is y-independent, so tile the z=0 slice
+        T_surface_slice = T_field_2D[0, :]  # T(z=0, x)
+        T_top_view = np.tile(T_surface_slice, (len(y_plot_axis), 1))
+        im0 = axes[0].imshow(
+            T_top_view, origin='lower', extent=[0, config.X, 0, config.Y], aspect='auto'
         )
-        ax.set_title(f"t = {t:.1f} s")
-        ax.set_xlabel("x (mm)")
-        ax.axvline(config.X_SOURCE_POS, color='cyan', linestyle='--', lw=1, label='Filo')
-        if i == 0:
-            ax.set_ylabel("y (mm)")
-            ax.legend()
+        axes[0].set_title("Top view (x-y)")
+        axes[0].set_xlabel("x [mm]")
+        axes[0].set_ylabel("y [mm]")
+        fig.colorbar(im0, ax=axes[0])
 
-    fig.suptitle(f"DATG Simulation: source at depth z_s={plot_z_s} mm", fontsize=16)
-    fig.colorbar(im, ax=axes.ravel().tolist(), label="Temperature increase (°C)", shrink=0.75)
-    # plt.tight_layout()
-    plt.show()
+        # Side view (x-z plane)
+        # This is just the 2D field we calculated
+        im1 = axes[1].imshow(
+            T_field_2D, origin='upper', extent=[0, config.X, 0, config.Z], aspect='auto'
+        )
+        axes[1].set_title("Side view (x-z)")
+        axes[1].set_xlabel("x [mm]")
+        axes[1].set_ylabel("z [mm]")
+        fig.colorbar(im1, ax=axes[1])
+
+        # Front view (y-z plane at x=center)
+        # Solution is y-independent, so tile the x=center slice
+        x_center_idx = config.X // 2
+        T_front_slice = T_field_2D[:, x_center_idx] # T(z, x=center)
+        # Tile T(z) along the y-axis
+        T_front_view = np.tile(T_front_slice[:, np.newaxis], (1, len(y_plot_axis)))
+        im2 = axes[2].imshow(
+            T_front_view, origin='upper', extent=[0, config.Y, 0, config.Z], aspect='auto'
+        )
+        axes[2].set_title("Front view (y-z)")
+        axes[2].set_xlabel("y [mm]")
+        axes[2].set_ylabel("z [mm]")
+        fig.colorbar(im2, ax=axes[2])
+
+        plt.tight_layout()
+        plt.show()
