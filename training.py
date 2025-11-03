@@ -11,14 +11,19 @@ from model import pinn_model, source_term_Q
 print(f"using device: {config.DEVICE}")
 
 # === Normalization constants ===
-T_scale = config.T
-L_scale = 100.0  # mm
-alpha_dimless = config.ALPHA * T_scale / (L_scale**2)
+T_scale = config.GLOBAL_MIN_TEMP
+L_scale = config.X
+alpha = config.ALPHA
+rho_c = config.RHO * config.C  # volumetric heat capacity [J/mm^3/C]
+q_prime = config.Q_PRIME  # heat source intensity [W/mm]
+tau_scale = L_scale**2 / alpha  # time scale 
+
+print(f"L_scale={L_scale:.3e}, tau_scale={tau_scale:.3e}, T_scale={T_scale:.3e}")
 
 
 def normalize_inputs(inputs):
-    """Normalize [t, x, y, z, z_s] using domain extents."""
-    t = inputs[:, 0:1] / T_scale
+    """Normalize inputs [t, x, y, z, z_s] nondimensionally."""
+    t = inputs[:, 0:1] / tau_scale
     x = inputs[:, 1:2] / L_scale
     y = inputs[:, 2:3] / L_scale
     z = inputs[:, 3:4] / L_scale
@@ -56,10 +61,10 @@ for epoch in range(config.N_EPOCHS):
 
     # === Normalize all inputs ===
     norm_inputs = normalize_inputs(train_inputs)
-
+    norm_outputs = train_outputs / T_scale
     # --- Data loss (superficial points, t > 0) ---
     data_inputs = norm_inputs[is_surface_point]
-    data_outputs = train_outputs[is_surface_point]
+    data_outputs = norm_outputs[is_surface_point]
     
     T_pred_data = pinn_model(data_inputs)
     loss_data = loss_fn(T_pred_data, data_outputs)
@@ -105,15 +110,14 @@ for epoch in range(config.N_EPOCHS):
     
     Q_phys = source_term_Q(x_phys, z_phys, z_s_phys)
 
-    Q_phys_scaled = Q_phys * T_scale
-    residual = dT_dt_norm - alpha_dimless * laplacian_norm  + Q_phys_scaled
-    
+    Q_norm = Q_phys * (tau_scale / (rho_c * T_scale))
+    residual = dT_dt_norm - laplacian_norm - Q_norm    
     residual_pde_only = residual[~is_ic_point] # Exclude IC points from PDE loss
     loss_pde = loss_fn(residual_pde_only, torch.zeros_like(residual_pde_only, device=config.DEVICE))
 
     # --- Initial condition loss (t = 0) ---
     ic_inputs = norm_inputs[is_ic_point]
-    ic_outputs = torch.full_like(ic_inputs[:, 0:1],config.GLOBAL_MIN_TEMP, device=config.DEVICE)  # T=T_amb at t=0
+    ic_outputs = torch.full_like(ic_inputs[:, 0:1],config.GLOBAL_MIN_TEMP/T_scale, device=config.DEVICE)  # T=T_amb at t=0
     T_pred_ic = pinn_model(ic_inputs)
     loss_ic = loss_fn(T_pred_ic, ic_outputs)
 
@@ -177,7 +181,7 @@ z_s_grid = np.full_like(X_grid, z_s_plot)
 # Normalize for network input
 inputs_infer_norm = np.stack(
     [
-        t_grid / T_scale,
+        t_grid / tau_scale,
         X_grid / L_scale,
         Y_grid / L_scale,
         z_grid / L_scale,
@@ -192,7 +196,10 @@ inputs_infer_torch = torch.tensor(
 
 # Predict temperature
 with torch.no_grad():
-    T_pred_absolute = pinn_model(inputs_infer_torch).cpu().numpy().reshape(ny, nx)
+    T_pred_absolute = pinn_model(inputs_infer_torch).cpu().numpy().reshape(ny, nx) * T_scale
+
+print(f"T_pred_absolute range: {T_pred_absolute.min():.3e} to {T_pred_absolute.max():.3e}")
+print(f"vmin={config.GLOBAL_MIN_TEMP}, vmax={np.max([config.GLOBAL_MAX_TEMP, T_pred_absolute.max()])}")
 
 # === Plot surface temperature ===
 plt.figure(figsize=(7, 5))
@@ -201,8 +208,8 @@ im = plt.imshow(
     extent=[0, config.X, 0, config.Y],
     origin="lower",
     cmap="hot",
-    vmin=config.GLOBAL_MIN_TEMP,
-    vmax=np.max([config.GLOBAL_MAX_TEMP, T_pred_absolute.max()]), # Auto-scale max
+    # vmin=config.GLOBAL_MIN_TEMP,
+    # vmax=np.max([config.GLOBAL_MAX_TEMP, T_pred_absolute.max()]), # Auto-scale max
     aspect="auto",
 )
 plt.colorbar(im, label="Temperature (°C)")
