@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.optim.lr_scheduler as lr_scheduler
 import numpy as np
 import matplotlib.pyplot as plt
 import time
@@ -17,8 +18,6 @@ alpha = config.ALPHA
 rho_c = config.RHO * config.C  # volumetric heat capacity [J/mm^3/C]
 q_prime = config.Q_PRIME  # heat source intensity [W/mm]
 tau_scale = L_scale**2 / alpha  # time scale 
-
-print(f"L_scale={L_scale:.3e}, tau_scale={tau_scale:.3e}, T_scale={T_scale:.3e}")
 
 
 def normalize_inputs(inputs):
@@ -44,7 +43,7 @@ print(f"Training outputs shape: {train_outputs.shape}")
 
 optimizer = torch.optim.Adam(pinn_model.parameters(), lr=config.LR)
 loss_fn = nn.MSELoss()
-
+scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
 # === Training loop ===
 loss_data_hist, loss_phys_hist, loss_total_hist = [], [], []
 
@@ -129,7 +128,8 @@ for epoch in range(config.N_EPOCHS):
 
     total_loss.backward()
     optimizer.step()
-
+    scheduler.step()
+    
     # === Track losses ===
     loss_data_hist.append(loss_data.item())
     loss_phys_hist.append(loss_phys.item())
