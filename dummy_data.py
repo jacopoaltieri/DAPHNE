@@ -45,8 +45,16 @@ N_ic = config.N_INITIAL
 t_ic = np.zeros((N_ic, 1))
 x_ic = np.random.rand(N_ic, 1) * config.X
 y_ic = np.random.rand(N_ic, 1) * config.Y
-z_ic = np.random.rand(N_ic, 1) * config.Z
+z_ic = np.zeros((N_ic, 1))
 T_ic_flat = np.full((N_ic, 1), config.GLOBAL_MIN_TEMP)  # initial temp
+
+# === Shared Boundary Condition points ===
+N_bc = config.N_BC
+t_bc = np.random.rand(N_bc, 1) * config.T
+x_bc = np.random.rand(N_bc, 1) * config.X
+y_bc = np.random.rand(N_bc, 1) * config.Y
+z_bc = np.full((N_bc, 1), config.Z)
+T_bc_flat = np.full((N_bc, 1), config.GLOBAL_PLATE_TEMP)  # boundary temp
 
 for z_s in z_sources_train:
     print(f"Generating data for source depth z_s={z_s} mm...")    
@@ -60,6 +68,10 @@ for z_s in z_sources_train:
         t_grid, x_grid, z_grid, z_s,
         config.X_SOURCE_POS, config.Q_PRIME, config.ALPHA, config.KAPPA, sigma=config.SIGMA
     )
+    
+    # Simulate the sensor's limited dynamic range (saturation)
+    T_data = np.clip(T_data, config.GLOBAL_MIN_TEMP, config.GLOBAL_MAX_TEMP)
+    
     
     # Flatten surface data
     t_data_flat = t_grid.flatten()[:, np.newaxis]
@@ -84,16 +96,22 @@ for z_s in z_sources_train:
     z_s_ic = np.full_like(x_ic, z_s)
     ic_inputs_combined = np.hstack([t_ic, x_ic, y_ic, z_ic, z_s_ic])
 
+    # --- Attach shared BC points (duplicate z_s for this source) ---
+    z_s_bc = np.full_like(x_bc, z_s)
+    bc_inputs_combined = np.hstack([t_bc, x_bc, y_bc, z_bc, z_s_bc])
+    
     # --- Combine all input/output sets ---
     inputs_combined = np.vstack([
         data_inputs_combined,
         phys_inputs_combined,
-        ic_inputs_combined
+        ic_inputs_combined,
+        bc_inputs_combined
     ])
     outputs_combined = np.vstack([
         T_data_flat,
-        np.zeros((config.N_COLLOCATION, 1)),  # dummy targets for PDE points
-        T_ic_flat                              # zero-temperature IC targets
+        np.full((config.N_COLLOCATION, 1),config.GLOBAL_MIN_TEMP),  # dummy targets for PDE points
+        T_ic_flat,                              #  IC temperature targets
+        T_bc_flat                               # boundary temperature targets
     ])
 
     all_train_inputs.append(inputs_combined)
@@ -108,10 +126,10 @@ if __name__ == "__main__":
     z_s = z_sources_train[0]
 
     # --- Use 2D grids for the 2D analytical solution ---
-    t_axis_plot = np.linspace(0, config.T, config.T) # Renamed to avoid confusion
+    t_axis_plot = np.linspace(0, config.T, config.T)
     x_plot_axis = np.linspace(0, config.X, config.X)
     z_plot_axis = np.linspace(0, config.Z, config.Z)
-    y_plot_axis = np.linspace(0, config.Y, config.Y) # Need this for tiling
+    y_plot_axis = np.linspace(0, config.Y, config.Y)
 
     t_idxs = [0, config.T // 2, config.T - 1]
 
@@ -122,57 +140,89 @@ if __name__ == "__main__":
         Z_plot_grid, X_plot_grid = np.meshgrid(z_plot_axis, x_plot_axis, indexing='ij')
 
         # --- Calculate the 2D temperature field T(z, x) ---
-        # Pass the scalar z_s (e.g., 10) as the 'z_s' argument
         T_field_2D = get_analytical_solution(
             t_val,
-            X_plot_grid,         # 'x' argument
-            Z_plot_grid,         # 'z' argument
-            z_s,                 # 'z_s' argument (the scalar)
+            X_plot_grid,
+            Z_plot_grid,
+            z_s,
             config.X_SOURCE_POS,
             config.Q_PRIME, config.ALPHA, config.KAPPA,
             sigma=config.SIGMA
         )
-        # T_field_2D now has shape (len(z), len(x))
+        
+        # *** NEW: Define the two different color limits ***
+        # 1. Clamped limits for the sensor view
+        vmin_clamped = config.GLOBAL_MIN_TEMP
+        vmax_clamped = config.GLOBAL_MAX_TEMP
+        
+        # 2. Real limits for the physics view
+        vmin_real = config.GLOBAL_MIN_TEMP
+        vmax_real = T_field_2D.max() # Find the true maximum temperature
 
         # --- Plot three views ---
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         fig.suptitle(f"Temperature at t={t_val:.2f} s (source z_s={z_s} mm)")
 
-        # Top view (x-y plane at z=top, z=0)
-        # Solution is y-independent, so tile the z=0 slice
+        # === Plot 0: Top view (x-y) - CLAMPED SENSOR VIEW ===
         T_surface_slice = T_field_2D[0, :]  # T(z=0, x)
         T_top_view = np.tile(T_surface_slice, (len(y_plot_axis), 1))
+        
+        # *** NEW: Clip the data for this plot ***
+        T_top_view_clamped = np.clip(T_top_view, vmin_clamped, vmax_clamped)
+        
         im0 = axes[0].imshow(
-            T_top_view, origin='lower', extent=[0, config.X, 0, config.Y], aspect='auto'
+            T_top_view_clamped,  # *** MOD: Plot the clamped data ***
+            origin='lower', 
+            extent=[0, config.X, 0, config.Y], 
+            aspect='auto',
+            cmap='hot',
+            # *** MOD: Set vmin/vmax to the clamped range ***
+            vmin=vmin_clamped,
+            vmax=vmax_clamped
         )
-        axes[0].set_title("Top view (x-y)")
+        axes[0].set_title(f"Top view (x-y) - Clamped Sensor ({vmin_clamped:.0f}-{vmax_clamped:.0f}°C)")
         axes[0].set_xlabel("x [mm]")
         axes[0].set_ylabel("y [mm]")
-        fig.colorbar(im0, ax=axes[0])
+        cb0 = fig.colorbar(im0, ax=axes[0])
+        cb0.set_label("Clamped Temp. (°C)")
 
-        # Side view (x-z plane)
-        # This is just the 2D field we calculated
+        # === Plot 1: Side view (x-z) - REAL TEMPERATURE ===
         im1 = axes[1].imshow(
-            T_field_2D, origin='upper', extent=[0, config.X, 0, config.Z], aspect='auto'
+            T_field_2D,  # *** MOD: Plot the real, unclamped data ***
+            origin='upper', 
+            extent=[0, config.X, 0, config.Z], 
+            aspect='auto',
+            cmap='hot',
+            # *** MOD: Set vmin/vmax to the real range ***
+            vmin=vmin_real,
+            vmax=vmax_real
         )
-        axes[1].set_title("Side view (x-z)")
+        axes[1].set_title(f"Side view (x-z) - Real Temp. ({vmin_real:.0f}-{vmax_real:.0f}°C)")
         axes[1].set_xlabel("x [mm]")
         axes[1].set_ylabel("z [mm]")
-        fig.colorbar(im1, ax=axes[1])
+        cb1 = fig.colorbar(im1, ax=axes[1])
+        cb1.set_label("Real Temp. (°C)")
 
-        # Front view (y-z plane at x=center)
-        # Solution is y-independent, so tile the x=center slice
+        # === Plot 2: Front view (y-z) - REAL TEMPERATURE ===
         x_center_idx = config.X // 2
         T_front_slice = T_field_2D[:, x_center_idx] # T(z, x=center)
-        # Tile T(z) along the y-axis
         T_front_view = np.tile(T_front_slice[:, np.newaxis], (1, len(y_plot_axis)))
+        
         im2 = axes[2].imshow(
-            T_front_view, origin='upper', extent=[0, config.Y, 0, config.Z], aspect='auto'
+            T_front_view,  # *** MOD: Plot the real, unclamped data ***
+            origin='upper', 
+            extent=[0, config.Y, 0, config.Z], 
+            aspect='auto',
+            cmap='hot',
+            # *** MOD: Set vmin/vmax to the real range ***
+            vmin=vmin_real,
+            vmax=vmax_real
         )
-        axes[2].set_title("Front view (y-z)")
+        axes[2].set_title(f"Front view (y-z) - Real Temp. ({vmin_real:.0f}-{vmax_real:.0f}°C)")
         axes[2].set_xlabel("y [mm]")
         axes[2].set_ylabel("z [mm]")
-        fig.colorbar(im2, ax=axes[2])
+        cb2 = fig.colorbar(im2, ax=axes[2])
+        cb2.set_label("Real Temp. (°C)")
 
         plt.tight_layout()
         plt.show()

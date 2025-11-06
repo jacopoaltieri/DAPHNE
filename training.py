@@ -12,12 +12,12 @@ from model import pinn_model, source_term_Q
 print(f"using device: {config.DEVICE}")
 
 # === Normalization constants ===
-T_scale = config.GLOBAL_MIN_TEMP
+T_scale = config.GLOBAL_MAX_TEMP - config.GLOBAL_MIN_TEMP
 L_scale = config.X
 alpha = config.ALPHA
 rho_c = config.RHO * config.C  # volumetric heat capacity [J/mm^3/C]
 q_prime = config.Q_PRIME  # heat source intensity [W/mm]
-tau_scale = L_scale**2 / alpha  # time scale 
+tau_scale = L_scale**2 / alpha  # time scale
 
 
 def normalize_inputs(inputs):
@@ -43,7 +43,7 @@ print(f"Training outputs shape: {train_outputs.shape}")
 
 optimizer = torch.optim.Adam(pinn_model.parameters(), lr=config.LR)
 loss_fn = nn.MSELoss()
-scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
 # === Training loop ===
 loss_data_hist, loss_phys_hist, loss_total_hist = [], [], []
 
@@ -54,19 +54,39 @@ for epoch in range(config.N_EPOCHS):
     optimizer.zero_grad()
 
     # --- Masks ---
-    is_ic_point = train_inputs[:, 0] < 1e-9  # t ~ 0
-    # z ~ 0 (surface) AND t > 0
+    is_ic_point = (train_inputs[:, 0] < 1e-9) & (
+        train_inputs[:, 3] < 1e-9
+    )  # t ~ 0 and z ~ 0
+    # Boundary condition (bottom plate, z=Z)
+    is_bc_point = train_inputs[:, 3] >= config.Z
+    # Surface data points (z=0, t > 0)
     is_surface_point = (train_inputs[:, 3] < 1e-9) & (~is_ic_point)
+    # PDE (collocation) points are everything else
+    is_pde_point = ~is_ic_point & ~is_bc_point & ~is_surface_point
 
     # === Normalize all inputs ===
     norm_inputs = normalize_inputs(train_inputs)
-    norm_outputs = train_outputs / T_scale
+    norm_outputs = (train_outputs - config.GLOBAL_MIN_TEMP) / T_scale
+    
     # --- Data loss (superficial points, t > 0) ---
     data_inputs = norm_inputs[is_surface_point]
     data_outputs = norm_outputs[is_surface_point]
-    
+
     T_pred_data = pinn_model(data_inputs)
-    loss_data = loss_fn(T_pred_data, data_outputs)
+    T_pred_data_clamped = torch.clamp(T_pred_data, 0.0, 1.0)  # Clamp to [0, 1] range
+    loss_data = loss_fn(T_pred_data_clamped, data_outputs)
+
+    # --- Initial condition loss (t = 0) ---
+    ic_inputs = norm_inputs[is_ic_point]
+    ic_outputs = norm_outputs[is_ic_point]
+    T_pred_ic = pinn_model(ic_inputs)
+    loss_ic = loss_fn(T_pred_ic, ic_outputs)
+
+    # --- boundary condition loss (z = Z) ---
+    bc_inputs = norm_inputs[is_bc_point]
+    bc_outputs = norm_outputs[is_bc_point]
+    T_pred_bc = pinn_model(bc_inputs)
+    loss_bc = loss_fn(T_pred_bc, bc_outputs)
 
     # --- Physics loss (PDE residual) ---
     inputs_phys = norm_inputs.clone()
@@ -106,30 +126,38 @@ for epoch in range(config.N_EPOCHS):
     x_phys = x_norm * L_scale
     z_phys = z_norm * L_scale
     z_s_phys = z_s_norm * L_scale
-    
+
     Q_phys = source_term_Q(x_phys, z_phys, z_s_phys)
 
-    Q_norm = Q_phys * (tau_scale / (rho_c * T_scale))
-    residual = dT_dt_norm - laplacian_norm - Q_norm    
-    residual_pde_only = residual[~is_ic_point] # Exclude IC points from PDE loss
-    loss_pde = loss_fn(residual_pde_only, torch.zeros_like(residual_pde_only, device=config.DEVICE))
+    Q_norm = Q_phys * (tau_scale / T_scale)
 
-    # --- Initial condition loss (t = 0) ---
-    ic_inputs = norm_inputs[is_ic_point]
-    ic_outputs = torch.full_like(ic_inputs[:, 0:1],config.GLOBAL_MIN_TEMP/T_scale, device=config.DEVICE)  # T=T_amb at t=0
-    T_pred_ic = pinn_model(ic_inputs)
-    loss_ic = loss_fn(T_pred_ic, ic_outputs)
+    residual = dT_dt_norm - laplacian_norm - Q_norm
+    residual_pde_only = residual[is_pde_point]
+    loss_phys = loss_fn(
+        residual_pde_only, torch.zeros_like(residual_pde_only, device=config.DEVICE)
+    )
 
-    # --- Combine into single physics loss ---
-    loss_phys = loss_pde + loss_ic
+    if epoch % 20 == 0:   
+        with torch.no_grad():
+            print("=== TERM MAGNITUDES ===")
+            print("dT_dt_norm: ", dT_dt_norm.min().item(), dT_dt_norm.max().item(), dT_dt_norm.abs().mean().item())
+            print("laplacian_norm: ", laplacian_norm.min().item(), laplacian_norm.max().item(), laplacian_norm.abs().mean().item())
+            print("Q_norm: ", Q_norm.min().item(), Q_norm.max().item(), Q_norm.abs().mean().item())
+            print("residual: ", residual.min().item(), residual.max().item(), residual.abs().mean().item())
+
+
 
     # --- Total loss ---
-    total_loss = loss_data + config.LAMBDA_PHYSICS * loss_phys
+    total_loss = (
+        loss_data
+        + config.LAMBDA_PHYSICS * loss_phys
+        + config.LAMBDA_CONDITIONS * (loss_ic + loss_bc)
+    )
 
     total_loss.backward()
     optimizer.step()
     scheduler.step()
-    
+
     # === Track losses ===
     loss_data_hist.append(loss_data.item())
     loss_phys_hist.append(loss_phys.item())
@@ -196,10 +224,16 @@ inputs_infer_torch = torch.tensor(
 
 # Predict temperature
 with torch.no_grad():
-    T_pred_absolute = pinn_model(inputs_infer_torch).cpu().numpy().reshape(ny, nx) * T_scale
+    T_pred_absolute = (
+        (pinn_model(inputs_infer_torch).cpu().numpy().reshape(ny, nx) * T_scale) + config.GLOBAL_MIN_TEMP
+    )
 
-print(f"T_pred_absolute range: {T_pred_absolute.min():.3e} to {T_pred_absolute.max():.3e}")
-print(f"vmin={config.GLOBAL_MIN_TEMP}, vmax={np.max([config.GLOBAL_MAX_TEMP, T_pred_absolute.max()])}")
+print(
+    f"T_pred_absolute range: {T_pred_absolute.min():.3e} to {T_pred_absolute.max():.3e}"
+)
+print(
+    f"vmin={config.GLOBAL_MIN_TEMP}, vmax={np.max([config.GLOBAL_MAX_TEMP, T_pred_absolute.max()])}"
+)
 
 # === Plot surface temperature ===
 plt.figure(figsize=(7, 5))
