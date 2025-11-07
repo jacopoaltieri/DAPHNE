@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 from torch.utils.data import TensorDataset, DataLoader
-from tqdm import tqdm  # === NEW: Import tqdm ===
+from tqdm import tqdm
 
 import config
 import dummy_data
@@ -15,9 +15,8 @@ from model import pinn_model, source_term_Q
 print(f"using device: {config.DEVICE}")
 
 # === Normalization constants ===
-# Note: This assumes (T - T_min) / T_scale normalization
-T_scale = config.GLOBAL_PLATE_TEMP - config.GLOBAL_MIN_TEMP
-L_scale = config.X
+T_scale = 10.0  # Temperature scale (°C)
+L_scale = config.Z
 alpha = config.ALPHA
 rho_c = config.RHO * config.C  # volumetric heat capacity [J/mm^3/C]
 q_prime = config.Q_PRIME  # heat source intensity [W/mm]
@@ -86,7 +85,7 @@ for epoch in epoch_loop:
 
         # === Normalize all BATCH inputs ===
         norm_batch_inputs = normalize_inputs(batch_inputs)
-        norm_batch_outputs = (batch_outputs - config.GLOBAL_MIN_TEMP) / T_scale
+        norm_batch_outputs = batch_outputs / T_scale
 
         # --- Data loss (superficial points, t > 0) ---
         data_inputs = norm_batch_inputs[is_surface_point]
@@ -96,7 +95,9 @@ for epoch in epoch_loop:
         if data_inputs.shape[0] > 0:
             T_pred_data = pinn_model(data_inputs)
             T_pred_data_clamped = torch.clamp(
-                T_pred_data,config.GLOBAL_MIN_TEMP/T_scale, config.GLOBAL_MAX_TEMP/T_scale
+                T_pred_data,
+                config.GLOBAL_MIN_TEMP / T_scale,
+                config.GLOBAL_MAX_TEMP / T_scale,
             )  # Clamp to screen range
             loss_data = loss_fn(T_pred_data_clamped, data_outputs)
 
@@ -291,8 +292,8 @@ inputs_infer_torch = torch.tensor(
 with torch.no_grad():
     # De-normalize: T_abs = (T_norm * T_scale) + T_min
     T_pred_absolute = (
-        pinn_model(inputs_infer_torch).cpu().numpy().reshape(ny, nx) * T_scale
-    ) + config.GLOBAL_MIN_TEMP
+        pinn_model(inputs_infer_torch).cpu().numpy().reshape(ny, nx)
+    ) * T_scale
 
 print(
     f"T_pred_absolute range: {T_pred_absolute.min():.3e} to {T_pred_absolute.max():.3e}"
